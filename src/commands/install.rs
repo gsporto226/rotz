@@ -152,10 +152,10 @@ impl<'b> Install<'b> {
       let run_result = self.run_env_command(entry.0, &inner_cmd, capture, shell, tmp_path.as_deref(), env, globals.dry_run)?;
 
       if let Err(err) = run_result {
-        if let helpers::RunError::Spawn(err) = &err {
-          if err.kind() == std::io::ErrorKind::NotFound {
-            eprintln!("\n Error: {:?}", Report::new(Error::CouldNotSpawn(format!("{:?}", self.config.shell_command))));
-          }
+        if let helpers::RunError::Spawn(err) = &err
+          && err.kind() == std::io::ErrorKind::NotFound
+        {
+          eprintln!("\n Error: {:?}", Report::new(Error::CouldNotSpawn(format!("{:?}", self.config.shell_command))));
         }
 
         let error = Error::InstallExecute(entry.0.clone(), err);
@@ -170,10 +170,10 @@ impl<'b> Install<'b> {
       installed.insert(entry.0.as_str());
     }
 
-    if !(install_command.skip_all_dependencies || install_command.skip_dependencies) {
-      if let Some(depends) = &entry.1.1 {
-        recurse!(depends, CyclicDependency);
-      }
+    if !(install_command.skip_all_dependencies || install_command.skip_dependencies)
+      && let Some(depends) = &entry.1.1
+    {
+      recurse!(depends, CyclicDependency);
     }
 
     ().pipe(Ok)
@@ -233,7 +233,7 @@ impl<'b> Install<'b> {
           let captured = helpers::parse_env_dump(&content);
           helpers::merge_env(env, &passed, &captured);
         } else {
-          eprintln!("Warning: could not read environment dump for \"{}\"", name);
+          eprintln!("Warning: could not read environment dump for \"{name}\"");
         }
       }
       let _ = std::fs::remove_file(tmp);

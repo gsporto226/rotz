@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 
 use crossterm::style::{Attribute, Stylize};
-use miette::{Diagnostic, Result};
+use miette::Result;
 use tap::Pipe;
 #[cfg(feature = "profiling")]
 use tracing::instrument;
@@ -11,17 +11,6 @@ use crate::{
   config::{self, Config},
   helpers,
 };
-
-#[derive(thiserror::Error, Diagnostic, Debug)]
-enum Error {
-  #[error("Clone command did not run successfully")]
-  #[diagnostic(transparent, code(clone::command::run))]
-  CloneExecute(
-    #[from]
-    #[diagnostic_source]
-    helpers::RunError,
-  ),
-}
 
 #[derive(Debug)]
 pub struct Clone {

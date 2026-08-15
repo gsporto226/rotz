@@ -83,13 +83,13 @@ impl<'a> Command for Link<'a> {
         for (to, from) in links {
           if !current_links.contains(to) {
             let mut removed = true;
-            if !globals.dry_run {
-              if let Err(err) = fs::remove_file(to) {
-                removed = false;
+            if !globals.dry_run
+              && let Err(err) = fs::remove_file(to)
+            {
+              removed = false;
 
-                if err.kind() != std::io::ErrorKind::NotFound {
-                  errors.push(Error::RemovingOrphan(from.clone(), to.clone(), err));
-                }
+              if err.kind() != std::io::ErrorKind::NotFound {
+                errors.push(Error::RemovingOrphan(from.clone(), to.clone(), err));
               }
             }
 
@@ -184,7 +184,7 @@ fn symlink(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::symlink_dir(from, to)?;
   } else {
     fs::symlink_file(from, to)?;
-  };
+  }
   ().pipe(Ok)
 }
 

@@ -128,7 +128,7 @@ impl Selectors {
       if selector.os.is_global() || os::OS == selector.os {
         let mut all = true;
         for attribute in &selector.attributes {
-          let value = match engine.render(&format!("{{{{ {} }}}}", &attribute.key), parameters) {
+          let value = match engine.render(&format!("{{{{ {} }}}}", attribute.key), parameters) {
             Ok(v) => v,
             Err(e) => {
               errors.push(e);
