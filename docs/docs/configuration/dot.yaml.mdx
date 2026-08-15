@@ -73,6 +73,29 @@ These dependencies will also be installed when the application is installed.
     depends: [ 'starship' ]
   }} />
 
+## Environment propagation
+
+Install commands that are part of the dependency graph (they either declare dependencies
+or are used as a dependency of another dot) run in a shell that captures the resulting
+environment and propagates it to the install commands that run afterwards. This means a
+dependency that sets an environment variable (for example by `export`ing it or updating
+`PATH`) can be relied upon by dots that depend on it.
+
+<TabedCodeBlock title="Example: nodejs/dot.{{ format }}" predots
+  data={{
+    installs: Section({
+      cmd: 'echo "export NODE_VERSION=20" >> ~/.profile',
+      depends: [ 'nvm' ]
+    })
+  }} />
+
+:::note
+Environment propagation is supported for the shells rotz ships as defaults (`bash`,
+`zsh` and `powershell`/`pwsh`). If a custom `shell_command` with another shell is used,
+or the install command is run without a shell, no propagation takes place. Only
+environment changes that are observable by the install process itself are propagated.
+:::
+
 
 ## Nesting
 

@@ -4,7 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-08-15
+
+### Added
+
+- Install commands that are part of the dependency graph now propagate their resulting
+  environment to dependent dots. This is supported for the default shells `bash`, `zsh`
+  and `powershell`/`pwsh`. For example, a dependency that sets an environment variable
+  can be relied upon by dots that depend on it.
 
 ## [1.2.1] - 2025-04-14
 

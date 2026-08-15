@@ -1,6 +1,8 @@
 use std::{
   collections::{HashMap, HashSet},
   fmt::Debug,
+  path::{Path, PathBuf},
+  sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crossterm::style::{Attribute, Stylize};
@@ -13,7 +15,12 @@ use velcro::hash_map;
 use wax::{Glob, Pattern};
 
 use super::Command;
-use crate::{config::Config, dot::Installs, helpers, templating};
+use crate::{
+  config::Config,
+  dot::Installs,
+  helpers::{self, SupportedShell},
+  templating,
+};
 
 #[derive(thiserror::Error, Diagnostic, Debug)]
 enum Error {
@@ -55,6 +62,13 @@ enum Error {
   ParseGlob(String, #[source] Box<wax::BuildError>),
 }
 
+static ENV_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn env_file_path() -> PathBuf {
+  let counter = ENV_FILE_COUNTER.fetch_add(1, Ordering::SeqCst);
+  std::env::temp_dir().join(format!("rotz-env-{}-{counter}", std::process::id()))
+}
+
 pub(crate) struct Install<'a> {
   config: Config,
   engine: templating::Engine<'a>,
@@ -72,12 +86,15 @@ impl<'b> Install<'b> {
   }
 
   #[cfg_attr(feature = "profiling", instrument)]
+  #[allow(clippy::too_many_arguments)]
   fn install<'a>(
     &self,
     dots: &'a HashMap<String, InstallsDots>,
     entry: (&'a String, &'a InstallsDots),
     installed: &mut HashSet<&'a str>,
     mut stack: IndexSet<String>,
+    env_dots: &HashSet<String>,
+    env: &mut HashMap<String, String>,
     (globals, install_command): (&crate::cli::Globals, &crate::cli::Install),
   ) -> Result<(), Error> {
     if installed.contains(entry.0.as_str()) {
@@ -111,6 +128,8 @@ impl<'b> Install<'b> {
             ),
             installed,
             stack.clone(),
+            env_dots,
+            env,
             (globals, install_command),
           )?;
         }
@@ -126,21 +145,13 @@ impl<'b> Install<'b> {
 
       let inner_cmd = installs.cmd.clone();
 
-      let cmd = if let Some(shell_command) = self.config.shell_command.as_ref() {
-        self
-          .engine
-          .render_template(shell_command, &hash_map! { "cmd": &inner_cmd })
-          .map_err(|err| Error::RenderingTemplate(entry.0.clone(), err.pipe(Box::new)))?
-      } else {
-        #[allow(clippy::redundant_clone)]
-        inner_cmd.clone()
-      };
+      let capture = env_dots.contains(entry.0.as_str());
+      let shell = self.config.shell_command.as_deref().and_then(SupportedShell::detect);
+      let tmp_path = capture.then(|| shell.map(|_| env_file_path())).flatten();
 
-      let cmd = shellwords::split(&cmd).map_err(|err| Error::ParsingInstallCommand(entry.0.clone(), err))?;
+      let run_result = self.run_env_command(entry.0, &inner_cmd, capture, shell, tmp_path.as_deref(), env, globals.dry_run)?;
 
-      println!("{}{inner_cmd}{}\n", Attribute::Italic, Attribute::Reset);
-
-      if let Err(err) = helpers::run_command(&cmd[0], &cmd[1..], false, globals.dry_run) {
+      if let Err(err) = run_result {
         if let helpers::RunError::Spawn(err) = &err {
           if err.kind() == std::io::ErrorKind::NotFound {
             eprintln!("\n Error: {:?}", Report::new(Error::CouldNotSpawn(format!("{:?}", self.config.shell_command))));
@@ -167,9 +178,97 @@ impl<'b> Install<'b> {
 
     ().pipe(Ok)
   }
+
+  /// Renders and runs an install command, optionally capturing its resulting
+  /// environment so it can be propagated to dependent dots. Returns the raw run
+  /// result (the caller handles failure reporting).
+  #[cfg_attr(feature = "profiling", instrument)]
+  #[allow(clippy::too_many_arguments)]
+  fn run_env_command(
+    &self,
+    name: &str,
+    inner_cmd: &str,
+    capture: bool,
+    shell: Option<SupportedShell>,
+    tmp_path: Option<&Path>,
+    env: &mut HashMap<String, String>,
+    dry_run: bool,
+  ) -> Result<Result<String, helpers::RunError>, Error> {
+    let render_cmd = match (capture, shell) {
+      (true, Some(shell)) => shell.wrap_command(inner_cmd, tmp_path.expect("tmp path is set when capturing")),
+      (true, None) => {
+        eprintln!(
+          "Warning: could not capture environment for \"{}\": shell command \"{}\" is not supported for environment propagation",
+          name,
+          self.config.shell_command.as_deref().unwrap_or("raw")
+        );
+        inner_cmd.to_owned()
+      }
+      (false, _) => inner_cmd.to_owned(),
+    };
+
+    let cmd = if let Some(shell_command) = self.config.shell_command.as_ref() {
+      self
+        .engine
+        .render_template(shell_command, &hash_map! { "cmd": &render_cmd })
+        .map_err(|err| Error::RenderingTemplate(name.to_owned(), err.pipe(Box::new)))?
+    } else {
+      render_cmd
+    };
+
+    let cmd = shellwords::split(&cmd).map_err(|err| Error::ParsingInstallCommand(name.to_owned(), err))?;
+
+    println!("{}{inner_cmd}{}\n", Attribute::Italic, Attribute::Reset);
+
+    if !capture {
+      return Ok(helpers::run_command(&cmd[0], &cmd[1..], false, dry_run));
+    }
+
+    let passed = env.clone();
+    let run_result = helpers::run_command_env(&cmd[0], &cmd[1..], Some(env), false, dry_run);
+
+    if let Some(tmp) = tmp_path {
+      if !dry_run && run_result.is_ok() {
+        if let Ok(content) = std::fs::read_to_string(tmp) {
+          let captured = helpers::parse_env_dump(&content);
+          helpers::merge_env(env, &passed, &captured);
+        } else {
+          eprintln!("Warning: could not read environment dump for \"{}\"", name);
+        }
+      }
+      let _ = std::fs::remove_file(tmp);
+    }
+
+    Ok(run_result)
+  }
 }
 
 type InstallsDots = (Option<Installs>, Option<HashSet<String>>);
+
+/// Returns the names of dots involved in the dependency graph: those that declare
+/// dependencies and those referenced as dependencies. Only these participate in
+/// environment propagation.
+fn dots_with_dependencies(dots: &HashMap<String, InstallsDots>) -> HashSet<String> {
+  let mut env_dots: HashSet<String> = HashSet::new();
+
+  for (name, (installs, depends)) in dots {
+    let mut referenced: HashSet<String> = HashSet::new();
+
+    if let Some(installs) = installs {
+      referenced.extend(installs.depends.iter().cloned());
+    }
+    if let Some(depends) = depends {
+      referenced.extend(depends.iter().cloned());
+    }
+
+    if !referenced.is_empty() {
+      env_dots.insert(name.clone());
+      env_dots.extend(referenced);
+    }
+  }
+
+  env_dots
+}
 
 impl Command for Install<'_> {
   type Args = (crate::cli::Globals, crate::cli::Install);
@@ -183,14 +282,112 @@ impl Command for Install<'_> {
       .map(|d| (d.0, (d.1.installs, d.1.depends)))
       .collect::<HashMap<String, InstallsDots>>();
 
+    let env_dots = dots_with_dependencies(&dots);
+
+    let mut env: HashMap<String, String> = std::env::vars().collect();
     let mut installed: HashSet<&str> = HashSet::new();
     let globs = helpers::glob_from_vec(&install_command.dots, None)?;
     for dot in &dots {
       if globs.is_match(dot.0.as_str()) {
-        self.install(&dots, dot, &mut installed, IndexSet::new(), (&globals, &install_command))?;
+        self.install(&dots, dot, &mut installed, IndexSet::new(), &env_dots, &mut env, (&globals, &install_command))?;
       }
     }
 
     ().pipe(Ok)
+  }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use speculoos::prelude::*;
+
+  use super::{Command, Install, InstallsDots, dots_with_dependencies};
+  use crate::{
+    cli::{Cli, Command as CliCommand, Globals, Install as InstallArgs, PathBuf},
+    config::{Config, LinkType},
+    templating::Engine,
+  };
+
+  fn fixture(dir: &str) -> std::path::PathBuf {
+    let base = std::env::temp_dir().join(format!("rotz-test-{dir}-{}", std::process::id()));
+    let dotfiles = base.join("dotfiles");
+    std::fs::create_dir_all(dotfiles.join("a")).unwrap();
+    std::fs::create_dir_all(dotfiles.join("b")).unwrap();
+    std::fs::write(dotfiles.join("a/dot.yaml"), "installs: 'export ROTZ_PROPAGATE_TEST=fromA'\n").unwrap();
+    std::fs::write(dotfiles.join("b/dot.yaml"), "installs:\n  cmd: 'test \"$ROTZ_PROPAGATE_TEST\" = \"fromA\"'\n  depends:\n    - ../a\n").unwrap();
+    base
+  }
+
+  fn run_install(dotfiles: &std::path::Path) -> miette::Result<()> {
+    let config = Config {
+      dotfiles: dotfiles.to_path_buf(),
+      link_type: LinkType::Symbolic,
+      shell_command: Some("bash -c {{ quote \"\" cmd }}".to_owned()),
+      variables: figment::value::Dict::new(),
+    };
+
+    let cli = Cli {
+      dry_run: false,
+      command: CliCommand::Init { repo: None },
+      config: PathBuf(std::env::temp_dir().join("rotz-test-config.yaml")),
+      dotfiles: Some(PathBuf(dotfiles.to_path_buf())),
+    };
+
+    let engine = Engine::new(&config, &cli);
+    let install = Install::new(config, engine);
+
+    let globals = Globals { dry_run: false };
+    let install_args = InstallArgs {
+      dots: vec!["**".to_owned()],
+      continue_on_error: false,
+      skip_dependencies: false,
+      skip_installation_dependencies: false,
+      skip_all_dependencies: false,
+    };
+
+    install.execute((globals, install_args))
+  }
+
+  #[test]
+  fn propagates_env_through_install_dependency() {
+    let base = fixture("prop");
+    let dotfiles = base.join("dotfiles");
+
+    let result = run_install(&dotfiles);
+    assert_that!(&result).is_ok();
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn env_dots_marks_related_dots() {
+    use std::collections::HashSet;
+
+    let mut dots: std::collections::HashMap<String, InstallsDots> = std::collections::HashMap::new();
+    dots.insert(
+      "/a".to_owned(),
+      (
+        Some(crate::dot::Installs {
+          cmd: "".to_owned(),
+          depends: HashSet::new(),
+        }),
+        None,
+      ),
+    );
+    dots.insert(
+      "/b".to_owned(),
+      (
+        Some(crate::dot::Installs {
+          cmd: "".to_owned(),
+          depends: ["/a".to_owned()].into(),
+        }),
+        None,
+      ),
+    );
+
+    let env_dots = dots_with_dependencies(&dots);
+
+    assert_that!(&env_dots).contains("/a".to_owned());
+    assert_that!(&env_dots).contains("/b".to_owned());
   }
 }
