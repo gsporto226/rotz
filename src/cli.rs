@@ -115,10 +115,6 @@ pub struct InstallRaw {
   #[baked(type = "Vec<String>", map_fn(bake = "|l| l.dots.add_root().dots"))]
   pub(crate) dots: Dots,
 
-  /// Continues installation when an error occurs during installation
-  #[clap(long, short)]
-  pub(crate) continue_on_error: bool,
-
   /// Do not install dependencies
   #[clap(long, short = 'd')]
   pub(crate) skip_dependencies: bool,

@@ -60,6 +60,10 @@ enum Error {
   #[error("Could not parse dependency \"{0}\"")]
   #[diagnostic(code(glob::parse))]
   ParseGlob(String, #[source] Box<wax::BuildError>),
+
+  #[error("{} install(s) failed", .0.len())]
+  #[diagnostic(code(install::partial_failure), help("The remaining installs were still attempted. Fix the failing installs and run again."))]
+  SomeInstallsFailed(Vec<String>),
 }
 
 static ENV_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -92,12 +96,14 @@ impl<'b> Install<'b> {
     dots: &'a HashMap<String, InstallsDots>,
     entry: (&'a String, &'a InstallsDots),
     installed: &mut HashSet<&'a str>,
+    failed: &mut HashSet<&'a str>,
+    failures: &mut Vec<String>,
     mut stack: IndexSet<String>,
     env_dots: &HashSet<String>,
     env: &mut HashMap<String, String>,
     (globals, install_command): (&crate::cli::Globals, &crate::cli::Install),
   ) -> Result<(), Error> {
-    if installed.contains(entry.0.as_str()) {
+    if installed.contains(entry.0.as_str()) || failed.contains(entry.0.as_str()) {
       return ().pipe(Ok);
     }
 
@@ -127,6 +133,8 @@ impl<'b> Install<'b> {
                 .ok_or_else(|| Error::DependencyNotFound(entry.0.clone(), dependency.clone()))?,
             ),
             installed,
+            failed,
+            failures,
             stack.clone(),
             env_dots,
             env,
@@ -141,6 +149,19 @@ impl<'b> Install<'b> {
         recurse!(&installs.depends, CyclicInstallDependency);
       }
 
+      if !(install_command.skip_all_dependencies || install_command.skip_installation_dependencies) {
+        let dependency_failed = installs
+          .depends
+          .iter()
+          .any(|dependency| Glob::new(dependency).is_ok_and(|glob| dots.iter().find(|d| glob.is_match(&**d.0)).is_some_and(|d| failed.contains(d.0.as_str()))));
+
+        if dependency_failed {
+          eprintln!("{}Skipping {}: install dependency failed{}\n", Attribute::Bold, entry.0.as_str().yellow(), Attribute::Reset);
+          failed.insert(entry.0.as_str());
+          return ().pipe(Ok);
+        }
+      }
+
       println!("{}Installing {}{}\n", Attribute::Bold, entry.0.as_str().blue(), Attribute::Reset);
 
       let inner_cmd = installs.cmd.clone();
@@ -151,23 +172,22 @@ impl<'b> Install<'b> {
 
       let run_result = self.run_env_command(entry.0, &inner_cmd, capture, shell, tmp_path.as_deref(), env, globals.dry_run)?;
 
-      if let Err(err) = run_result {
-        if let helpers::RunError::Spawn(err) = &err
-          && err.kind() == std::io::ErrorKind::NotFound
-        {
-          eprintln!("\n Error: {:?}", Report::new(Error::CouldNotSpawn(format!("{:?}", self.config.shell_command))));
+      match run_result {
+        Ok(_) => {
+          installed.insert(entry.0.as_str());
         }
+        Err(err) => {
+          if let helpers::RunError::Spawn(spawn_err) = &err
+            && spawn_err.kind() == std::io::ErrorKind::NotFound
+          {
+            eprintln!("\n Error: {:?}", Report::new(Error::CouldNotSpawn(format!("{:?}", self.config.shell_command))));
+          }
 
-        let error = Error::InstallExecute(entry.0.clone(), err);
-
-        if install_command.continue_on_error {
-          eprintln!("\n Error: {:?}", Report::new(error));
-        } else {
-          return error.pipe(Err);
+          eprintln!("\n Error: {:?}", Report::new(Error::InstallExecute(entry.0.clone(), err)));
+          failures.push(entry.0.clone());
+          failed.insert(entry.0.as_str());
         }
       }
-
-      installed.insert(entry.0.as_str());
     }
 
     if !(install_command.skip_all_dependencies || install_command.skip_dependencies)
@@ -286,11 +306,27 @@ impl Command for Install<'_> {
 
     let mut env: HashMap<String, String> = std::env::vars().collect();
     let mut installed: HashSet<&str> = HashSet::new();
+    let mut failed: HashSet<&str> = HashSet::new();
+    let mut failures: Vec<String> = Vec::new();
     let globs = helpers::glob_from_vec(&install_command.dots, None)?;
     for dot in &dots {
       if globs.is_match(dot.0.as_str()) {
-        self.install(&dots, dot, &mut installed, IndexSet::new(), &env_dots, &mut env, (&globals, &install_command))?;
+        self.install(
+          &dots,
+          dot,
+          &mut installed,
+          &mut failed,
+          &mut failures,
+          IndexSet::new(),
+          &env_dots,
+          &mut env,
+          (&globals, &install_command),
+        )?;
       }
+    }
+
+    if !failures.is_empty() {
+      return Err(Report::new(Error::SomeInstallsFailed(failures)));
     }
 
     ().pipe(Ok)
@@ -339,7 +375,6 @@ mod tests {
     let globals = Globals { dry_run: false };
     let install_args = InstallArgs {
       dots: vec!["**".to_owned()],
-      continue_on_error: false,
       skip_dependencies: false,
       skip_installation_dependencies: false,
       skip_all_dependencies: false,
@@ -355,6 +390,28 @@ mod tests {
 
     let result = run_install(&dotfiles);
     assert_that!(&result).is_ok();
+
+    let _ = std::fs::remove_dir_all(&base);
+  }
+
+  #[test]
+  fn skips_install_when_dependency_fails() {
+    let base = std::env::temp_dir().join(format!("rotz-test-skip-{}", std::process::id()));
+    let dotfiles = base.join("dotfiles");
+    let marker_b = base.join("marker_b");
+    let marker_c = base.join("marker_c");
+    std::fs::create_dir_all(dotfiles.join("a")).unwrap();
+    std::fs::create_dir_all(dotfiles.join("b")).unwrap();
+    std::fs::create_dir_all(dotfiles.join("c")).unwrap();
+    std::fs::write(dotfiles.join("a/dot.yaml"), "installs: 'exit 1'\n").unwrap();
+    std::fs::write(dotfiles.join("b/dot.yaml"), format!("installs:\n  cmd: 'touch {}'\n  depends:\n    - ../a\n", marker_b.display())).unwrap();
+    std::fs::write(dotfiles.join("c/dot.yaml"), format!("installs: 'touch {}'\n", marker_c.display())).unwrap();
+
+    let result = run_install(&dotfiles);
+    assert_that!(&result).is_err();
+
+    assert_that!(marker_c.exists()).is_true();
+    assert_that!(marker_b.exists()).is_false();
 
     let _ = std::fs::remove_dir_all(&base);
   }
