@@ -157,10 +157,10 @@ pub enum SupportedShell {
 
 impl SupportedShell {
   pub fn detect(shell_command: &str) -> Option<Self> {
-    let first = shell_command.split_whitespace().next()?.trim_end_matches(".exe").to_ascii_lowercase();
-    let name = Path::new(&first).file_name().and_then(|n| n.to_str()).unwrap_or(&first);
+    let first = shell_command.split_whitespace().next()?;
+    let name = first.rsplit(['/', '\\']).next().unwrap_or(first).trim_end_matches(".exe").to_ascii_lowercase();
 
-    match name {
+    match name.as_str() {
       "powershell" | "pwsh" => Some(Self::Powershell),
       "bash" => Some(Self::Bash),
       "zsh" => Some(Self::Zsh),
